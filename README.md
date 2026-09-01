@@ -1,9 +1,16 @@
 <a href="">
-    <img width="1024" alt="Warp Agentic Development Environment product preview" src="https://github.com/user-attachments/assets/9976b2da-2edd-4604-a36c-8fd53719c6d4" />
+    <img width="1024" alt="Warp Agentic Development Environment product preview" src="/JUNK/preview.png" />
 </a>
 &nbsp;
 
 <h1></h1>
+
+## About
+Kaden is a fork from Warp terminal
+* Removed all sign in, account, drive and AI prompts
+* Local-first, disabled all telemetry, network request and auto-updates
+* Decluttered cleaner UI
+* Modular code-base for easier faster development (in-progress)
 
 ## Licensing
 
@@ -13,12 +20,9 @@ The rest of the code in this repository is licensed under the [AGPL v3](LICENSE-
 
 ### Build & Compiling
 
-To build from source:
-
 ```bash
-./script/bootstrap   # platform-specific setup
-./script/run         # build and run Warp
-./script/presubmit   # fmt, clippy, and tests
+cargo run                                                # Testing
+cargo build --release --bin warp-oss # Create executable binary
 ```
 
 ## Support and Questions
