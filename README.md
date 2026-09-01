@@ -5,15 +5,15 @@
 
 ## Kaden Terminal
 
-Kaden is a fork of Warp terminal designed to be bloat and telemetry free.
+Kaden is a Terminal Emulator and fork of warp with proper clipboard support and fully configurable keybindings - designed to be bloat and telemetry free.
 
 ## Why Kaden?
-- Configure your own hotkeys with full clipboard support and smart copy / kill, no more using your mouse to copy or awkward ctrl - shift - c.
-- Zero sign in, account, cloud, drive and AI prompts.
+- Configure your own hotkeys with full clipboard support and smart copy / kill, no more using your mouse to select your code or awkward ctrl-shift-c to perform basic copy pasting.
+- Zero sign in, account, cloud, drive or AI prompts.
 - Local-first, no telemetry, background network request or auto-updates.
-- Decluttered cleaner UI.
+- Decluttered clean UI.
 - Modular code-base for easier faster development (in-progress).
-- Performance, built in Rust with a leaner binary.
+- Fast, built in Rust with a leaner binary.
 
 ### Build & Compiling
 
