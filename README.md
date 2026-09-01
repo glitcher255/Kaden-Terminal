@@ -3,17 +3,15 @@
 </a>
 &nbsp;
 
-<h1></h1>
-
 ## Kaden Terminal
 
 Kaden is a fork of Warp terminal designed to be bloat and telemetry free.
 
 ## Why Kaden?
+- Configure your own hotkeys with full clipboard support and smart copy / kill, no more using your mouse to copy or awkward ctrl - shift - c.
 - Zero sign in, account, cloud, drive and AI prompts.
 - Local-first, no telemetry, background network request or auto-updates.
 - Decluttered cleaner UI.
-- Configure your own hotkeys with support for smart copy / kill, no more using your mouse to copy or awkward ctrl - shift - c.
 - Modular code-base for easier faster development (in-progress).
 - Performance, built in Rust with a leaner binary.
 
@@ -30,7 +28,7 @@ Found a bug or would like to submit a feature or code contribution? please open 
 
 ## Licensing
 
-UI framework (`warpui_core` and `warpui` crates) are licensed under the [MIT license](LICENSE-MIT).x
+UI framework (`warpui_core` and `warpui` crates) are licensed under the [MIT license](LICENSE-MIT).
 
 All other code in this repository is licensed under the [AGPL v3](LICENSE-AGPL).
 
