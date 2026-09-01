@@ -5,33 +5,37 @@
 
 <h1></h1>
 
-## About
-Kaden is a fork from Warp terminal
-* Removed all sign in, account, drive and AI prompts
-* Local-first, disabled all telemetry, network request and auto-updates
-* Decluttered cleaner UI
-* Modular code-base for easier faster development (in-progress)
+## Kaden Terminal
 
-## Licensing
+Kaden is a fork of Warp terminal designed to be bloat and telemetry free.
 
-Warp's UI framework (the `warpui_core` and `warpui` crates) are licensed under the [MIT license](LICENSE-MIT).
-
-The rest of the code in this repository is licensed under the [AGPL v3](LICENSE-AGPL).
+## Why Kaden?
+- Zero sign in, account, cloud, drive and AI prompts.
+- Local-first, no telemetry, background network request or auto-updates.
+- Decluttered cleaner UI.
+- Configure your own hotkeys with support for smart copy / kill, no more using your mouse to copy or awkward ctrl - shift - c.
+- Modular code-base for easier faster development (in-progress).
+- Performance, built in Rust with a leaner binary.
 
 ### Build & Compiling
 
 ```bash
-cargo run                                                # Testing
-cargo build --release --bin warp-oss # Create executable binary
+cargo run # Testing and development
+cargo build --release --bin warp-oss # Create release binary
 ```
 
-## Support and Questions
+## Contribute
 
-[`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB).
+Found a bug or would like to submit a feature or code contribution? please open a GitHub issue.
+
+## Licensing
+
+UI framework (`warpui_core` and `warpui` crates) are licensed under the [MIT license](LICENSE-MIT).x
+
+All other code in this repository is licensed under the [AGPL v3](LICENSE-AGPL).
 
 ## Open Source Dependencies
 
-[Warp license webpage](https://docs.warp.dev/help/licenses)
 - [Tokio](https://github.com/tokio-rs/tokio)
 - [NuShell](https://github.com/nushell/nushell)
 - [Fig Completion Specs](https://github.com/withfig/autocomplete)
