@@ -9,7 +9,7 @@ Kaden is a Terminal Emulator and a fork of warp with proper clipboard support an
 
 ## Why Kaden?
 - Configure your own hotkeys with full clipboard support and smart copy / kill, no more using your mouse to select your code or awkward ctrl-shift-c to perform basic copy pasting.
-- Zero sign in, account, cloud, drive or AI prompts.
+- No warp AI, sign in, account, cloud or drive prompts.
 - Local-first, no telemetry, background network request or auto-updates.
 - Decluttered clean UI.
 - Modular code-base for easier faster development (in-progress).
