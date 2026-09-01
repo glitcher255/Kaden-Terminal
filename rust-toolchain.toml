@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.98.0"  # (terrible idea) Glitcher - upgraded rust toolchain version from "1.92.0" to "1.98.0" for faster compile and run time
+components = ["rustfmt", "clippy", "rust-analyzer", ]  # "rustc-codegen-cranelift-preview" (terrible idea) added "rustc-codegen-cranelift-preview" for cranelift over LLVM compile speed up, still testing
+profile = "minimal"

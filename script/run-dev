@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+# Jump to repository root
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "${REPO_ROOT}"
+
+# Hardcode environment vars
+export FEATURES="gui"
+export WARP_BIN_NAME="warp-oss"
+export WARP_CHANNEL="oss"
+
+# Launch Cargo immediately
+echo "Faster script"
+exec cargo run --bin "$WARP_BIN_NAME" --features "$FEATURES" "$@"
