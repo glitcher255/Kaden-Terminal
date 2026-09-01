@@ -73,7 +73,7 @@ jobs:
       should_publish: ${{ steps.set_publish.outputs.should_publish }}
     steps:
       - name: Checkout sources
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Get channel configuration
         id: get-config
@@ -152,7 +152,7 @@ jobs:
           - arch: x86_64
             dmg_name_suffix: x86_64
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -281,7 +281,7 @@ jobs:
     if: ${{ inputs.build_macos != false }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -450,7 +450,7 @@ jobs:
           - arch: aarch64
           - arch: x86_64
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -533,7 +533,7 @@ jobs:
           - arch: aarch64
           - arch: x86_64
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -644,7 +644,7 @@ jobs:
           - arch: aarch64
           - arch: x86_64
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -727,7 +727,7 @@ jobs:
           - arch: aarch64
           - arch: x86_64
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -851,7 +851,7 @@ jobs:
           - arch: aarch64
             runner: namespace-profile-ubuntu-20-04-arm
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -938,7 +938,7 @@ jobs:
           - arch: aarch64
             runner: namespace-profile-ubuntu-20-04-arm
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -1062,7 +1062,7 @@ jobs:
       # easier and less error-prone than trying to install it).
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -1224,7 +1224,7 @@ jobs:
     if: ${{ inputs.build_linux != false }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -1305,7 +1305,7 @@ jobs:
     if: ${{ inputs.build_linux != false }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -1503,7 +1503,7 @@ jobs:
       # easier and less error-prone than trying to install it).
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -1594,7 +1594,7 @@ jobs:
     if: ${{ inputs.build_linux != false }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -1677,7 +1677,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout sources
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare_release.outputs.release_branch }}
 
@@ -1946,7 +1946,7 @@ jobs:
     if: ${{ inputs.build_web != false }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -2070,7 +2070,7 @@ jobs:
           - arch: arm64
             runner: windows-arm-latest-large
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -2146,7 +2146,7 @@ jobs:
       TRUSTED_SIGNING_ACCOUNT: warpdotdev
       TRUSTED_SIGNING_CERT_PROFILE: warpterminal
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -2290,7 +2290,7 @@ jobs:
           - arch: arm64
             runner: windows-arm-latest-large
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -2364,7 +2364,7 @@ jobs:
       TRUSTED_SIGNING_ACCOUNT: warpdotdev
       TRUSTED_SIGNING_CERT_PROFILE: warpterminal
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/prepare_environment
         with:
@@ -2646,7 +2646,7 @@ jobs:
       - prepare_release
       - collect_results
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         name: Checkout sources
         with:
           # Fetch history for all tags and branches so we can compare revisions
