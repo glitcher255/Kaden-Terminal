@@ -5,7 +5,7 @@
 
 ## Kaden Terminal
 
-Kaden is a Terminal Emulator and fork of warp with proper clipboard support and fully configurable keybindings - designed to be bloat and telemetry free.
+Kaden is a Terminal Emulator and a fork of warp with proper clipboard support and fully configurable keybindings - designed to be bloat and telemetry free.
 
 ## Why Kaden?
 - Configure your own hotkeys with full clipboard support and smart copy / kill, no more using your mouse to select your code or awkward ctrl-shift-c to perform basic copy pasting.
