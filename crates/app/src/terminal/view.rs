@@ -3059,6 +3059,142 @@ impl TerminalView {
         }
     }
 
+///////////////////////////////////////////
+////////// GLITCHER //////////////////
+////////DOCUMENTATION /////////
+////////////////////////////////////////
+
+    // Runs on copy or kill input - Check AI agent is active or prompting - else continue to input_copy_or_kill_handler()
+    fn handle_ctrl_c_input_event( &mut self, cleared_buffer_len: usize, ctx: &mut ViewContext<Self>, ) {
+        let did_resolve_prompt_suggestion = self
+            .resolve_passive_suggestion(PromptSuggestionResolution::Reject { ctrl_c: true }, ctx);
+        if did_resolve_prompt_suggestion {
+            if FeatureFlag::AgentView.is_enabled()
+                && self.agent_view_controller.as_ref(ctx).is_active()
+            {
+                self.agent_view_controller.update(ctx, |controller, ctx| {
+                    controller.clear_pending_exit_confirmation(ctx);
+                });
+            }
+            return;
+        }
+        if FeatureFlag::AgentView.is_enabled() && self.agent_view_controller.as_ref(ctx).is_active() {
+            if cleared_buffer_len > 0 {
+                self.agent_view_controller.update(ctx, |controller, ctx| {
+                    controller.clear_pending_exit_confirmation(ctx);
+                });
+                return;
+            }
+            if self.should_ctrl_c_exit_agent_view(ctx) {
+                self.agent_view_controller.update(ctx, |controller, ctx| {
+                    controller.exit_agent_view_with_required_confirmation(
+                        ExitConfirmationTrigger::CtrlC,
+                        ctx,
+                    );
+                });
+                return;
+            }
+        }
+        // self.ctrl_c(ctx); // replaced
+        self.input_copy_or_kill_handler(ctx);
+    }
+
+    // Check if text is selected then copy or kill (orchesterator)
+    fn input_copy_or_kill_handler(&mut self, ctx: &mut ViewContext<Self>) {
+        let ( is_copiable_block_selected, has_block_list_selection, has_alt_screen_selection, active_block_state) = self.is_text_highlighted(ctx);
+        self.copy_or_kill( is_copiable_block_selected, has_block_list_selection, has_alt_screen_selection, active_block_state, ctx, )
+    }
+
+    // Check if text is highlighted
+    fn is_text_highlighted(&mut self, ctx: &mut ViewContext<Self> ) -> (bool, bool, bool, CtrlCActiveBlockState) {
+        // Glitcher- Check if terminal's input text is selected - it only checked block copies by default (WHY?)
+        let has_input_selection = {
+            let selected_input_text = self.input.read(ctx, |input, ctx| {
+                input.editor().read(ctx, |editor, ctx| editor.selected_text(ctx))
+            });
+            !selected_input_text.is_empty()
+        };
+
+        let (has_block_list_selection, has_alt_screen_selection, active_block_state) = {
+            let model = self.model.lock();
+            let has_alt_screen_selection = model.alt_screen().selection().is_some();
+
+             // set to true if Block OR input text is also selected // Glitcher
+             // This needs to be consolidated into one pipe instead of checking for block / text seperately
+            let has_block_list_selection = model.block_list().selection().is_some() || has_input_selection;
+
+            let active_block = model.block_list().active_block();
+            let is_long_running = active_block.is_active_and_long_running();
+            let is_agent_in_control_of_command = active_block.is_agent_in_control();
+            let conversation_id_to_stop = active_block
+                .long_running_control_state()
+                .and_then(|state| {
+                    state
+                        .user_take_over_reason()
+                        .is_some_and(UserTakeOverReason::is_stop)
+                        .then(|| active_block.ai_conversation_id())
+                })
+                .flatten();
+            let active_block_state = CtrlCActiveBlockState { is_long_running, is_agent_in_control_of_command, conversation_id_to_stop, };
+            ( has_block_list_selection, has_alt_screen_selection, active_block_state, )
+        };
+        // We don't want to copy blocks in AI input mode because those are context blocks.
+        let is_copiable_block_selected = !self.selected_blocks.is_empty()
+            && !self.ai_input_model.as_ref(ctx).is_ai_input_enabled();
+
+        // We want to focus the input/rich content block if it is active.
+        self.redetermine_global_focus(ctx);
+        ctx.notify();
+        return (is_copiable_block_selected, has_block_list_selection, has_alt_screen_selection, active_block_state);
+    
+    }
+
+    // if text is highlighted, calls self.copy() else calls self.ctrl_c_to_active_block() (normal ctrl-c  behaviour.)
+    fn copy_or_kill( &mut self, is_copiable_block_selected: bool, has_block_list_selection: bool, has_alt_screen_selection: bool, active_block_state: CtrlCActiveBlockState, ctx: &mut ViewContext<Self>, ) {
+            println!("ctrl_c_internal called");
+            println!("{} {} {}", has_block_list_selection, has_alt_screen_selection, is_copiable_block_selected);
+        if has_block_list_selection {             // If text is highlighted, copy
+            self.copy(ctx);
+            self.clear_selections_when_shell_mode_without_focusing_input(ctx);
+            return;
+        } else if has_alt_screen_selection {      // If text is highlighted, copy 
+            self.copy(ctx);
+            self.model.lock().alt_screen_mut().clear_selection();
+            return;
+        }  else if is_copiable_block_selected {   // If text is highlighted, copy 
+            // If there are blocks selected, we want to copy them but not prevent the normal ctrl-c behaviour.
+            self.copy(ctx);
+            self.clear_selections_when_shell_mode_without_focusing_input(ctx);
+        }
+        self.kill_active_process(active_block_state, ctx);  // Send kill signal
+    }
+
+    // Kill active process
+    fn kill_active_process( &mut self, active_block_state: CtrlCActiveBlockState, ctx: &mut ViewContext<Self>, ) {
+        if active_block_state.is_agent_in_control_of_command {
+            self.cli_subagent_controller.update(ctx, |controller, ctx| {
+                controller.switch_control_to_user(
+                    UserTakeOverReason::Stop {
+                        should_auto_resume: true,
+                    },
+                    ctx,
+                );
+            });
+        } else if active_block_state.is_long_running {
+            // A second Ctrl+C after Stop takeover should cancel both the command and conversation.
+            if let Some(conversation_id) = active_block_state.conversation_id_to_stop {
+                self.stop_local_agent_conversation(conversation_id, ctx);
+            } else {
+                self.user_write_ctrl_c_to_pty(ctx);
+            }
+        } else {
+            self.maybe_handle_ctrl_c_in_rich_content_block(ctx);
+        }
+    }
+
+//////////////////////////////////////////////////
+///////// DOCUMENTATION END /////////
+////////////////////////////////////////////////
     /// Marks rich content views as dirty if their metadata matches the given predicate.
     ///
     /// Rich content heights are stored in the blocklist sumtree. When a view's rendered height
@@ -3067,11 +3203,7 @@ impl TerminalView {
     /// which happens unconditionally before viewport iteration. This is important for items
     /// that may have 0 height in the sumtree, as the viewport iterator would otherwise skip
     /// them entirely.
-    fn mark_all_rich_content_items_dirty_where(
-        &self,
-        model: &mut TerminalModel,
-        predicate: impl Fn(&RichContentMetadata) -> bool,
-    ) {
+    fn mark_all_rich_content_items_dirty_where( &self, model: &mut TerminalModel, predicate: impl Fn(&RichContentMetadata) -> bool,) {
         for content in &self.rich_content_views {
             if content.metadata().is_some_and(&predicate) {
                 model
@@ -3844,7 +3976,7 @@ impl TerminalView {
                 });
                 ctx.emit(Event::SummarizationCancelDialogToggled { is_open: *is_open });
             }
-            BlocklistAIStatusBarEvent::Stop => me.ctrl_c(ctx),
+            BlocklistAIStatusBarEvent::Stop => me.input_copy_or_kill_handler(ctx),
         });
 
         let ai_render_context = Rc::new(RefCell::new(BlocklistAIRenderContext {
@@ -7635,7 +7767,7 @@ impl TerminalView {
             ShellCommandExecutorEvent::CancelExecution => {
                 // We need to manually invoke ctrl-c to terminate the running command because the
                 // user's ctrl-c was directed to the AIBlock instead of the command's shell block.
-                self.ctrl_c(ctx);
+                self.input_copy_or_kill_handler(ctx);
             }
             ShellCommandExecutorEvent::TransferControlToUser { reason, .. } => {
                 // Transfer control of the long-running command to the user.
@@ -8734,11 +8866,7 @@ impl TerminalView {
         ctx.emit(Event::ShutdownPty);
     }
 
-    pub(crate) fn stop_local_agent_conversation(
-        &mut self,
-        conversation_id: AIConversationId,
-        ctx: &mut ViewContext<Self>,
-    ) {
+    pub(crate) fn stop_local_agent_conversation( &mut self, conversation_id: AIConversationId, ctx: &mut ViewContext<Self>,) {
         let had_active_stream = self
             .ai_controller
             .as_ref(ctx)
@@ -8798,148 +8926,90 @@ impl TerminalView {
         self.write_user_bytes_to_pty(vec![escape_sequences::C0::ETX], ctx);
     }
 
-    // Runs when smart-c is run
-    // Checks AI agent is active or prompting - else continue to ctrl_c()
-    fn handle_ctrl_c_input_event( &mut self, cleared_buffer_len: usize, ctx: &mut ViewContext<Self>, ) {
-        let did_resolve_prompt_suggestion = self
-            .resolve_passive_suggestion(PromptSuggestionResolution::Reject { ctrl_c: true }, ctx);
-        if did_resolve_prompt_suggestion {
-            if FeatureFlag::AgentView.is_enabled()
-                && self.agent_view_controller.as_ref(ctx).is_active()
-            {
-                self.agent_view_controller.update(ctx, |controller, ctx| {
-                    controller.clear_pending_exit_confirmation(ctx);
-                });
-            }
-            return;
-        }
-        if FeatureFlag::AgentView.is_enabled() && self.agent_view_controller.as_ref(ctx).is_active() {
-            if cleared_buffer_len > 0 {
-                self.agent_view_controller.update(ctx, |controller, ctx| {
-                    controller.clear_pending_exit_confirmation(ctx);
-                });
-                return;
-            }
-            if self.should_ctrl_c_exit_agent_view(ctx) {
-                self.agent_view_controller.update(ctx, |controller, ctx| {
-                    controller.exit_agent_view_with_required_confirmation(
-                        ExitConfirmationTrigger::CtrlC,
-                        ctx,
-                    );
-                });
-                return;
-            }
-        }
-        self.ctrl_c(ctx);
-    }
 
-    /// Windows users expect ctrl-c to copy if there is selected text. Otherwise, we perform the normal ctrl-c action.
-    // GLITCHER
-    // Checks if text is highlighted in standard terminal or alt terminal (nano, vim etc..) then calls ctrl_c_internal()
-    // Bug does not detect text highlight - has_block_list_selection always resolve to false
-    // Rename this from ctrl_c to smart copy, and all other ctrl_c hard coded references
-    // todo version 1.1
-    fn ctrl_c(&mut self, ctx: &mut ViewContext<Self>) {
+    // // GLITCHER
+    // // Checks if text is highlighted in standard terminal or alt terminal (nano, vim etc..) then calls ctrl_c_internal()
+    // // Rename this from ctrl_c to smart copy, and all other ctrl_c hard coded references
+    // // todo version 1.1
+    // fn ctrl_c(&mut self, ctx: &mut ViewContext<Self>) {
 
-        // Glitcher- Check if terminal's input text is selected - it only checked block copies by default (WHY?)
-        let has_input_selection = {
-            let selected_input_text = self.input.read(ctx, |input, ctx| {
-                input.editor().read(ctx, |editor, ctx| editor.selected_text(ctx))
-            });
-            !selected_input_text.is_empty()
-        };
+    //     // Glitcher- Check if terminal's input text is selected - it only checked block copies by default (WHY?)
+    //     let has_input_selection = {
+    //         let selected_input_text = self.input.read(ctx, |input, ctx| {
+    //             input.editor().read(ctx, |editor, ctx| editor.selected_text(ctx))
+    //         });
+    //         !selected_input_text.is_empty()
+    //     };
 
-        let (has_block_list_selection, has_alt_screen_selection, active_block_state) = {
-            let model = self.model.lock();
-            let has_alt_screen_selection = model.alt_screen().selection().is_some();
+    //     let (has_block_list_selection, has_alt_screen_selection, active_block_state) = {
+    //         let model = self.model.lock();
+    //         let has_alt_screen_selection = model.alt_screen().selection().is_some();
 
-             // set to true if Block OR input text is also selected // Glitcher
-             // This needs to be consolidated into one pipe instead of checking for block / text seperately
-            let has_block_list_selection = model.block_list().selection().is_some() || has_input_selection;
+    //          // set to true if Block OR input text is also selected // Glitcher
+    //          // This needs to be consolidated into one pipe instead of checking for block / text seperately
+    //         let has_block_list_selection = model.block_list().selection().is_some() || has_input_selection;
 
-            let active_block = model.block_list().active_block();
-            let is_long_running = active_block.is_active_and_long_running();
-            let is_agent_in_control_of_command = active_block.is_agent_in_control();
-            let conversation_id_to_stop = active_block
-                .long_running_control_state()
-                .and_then(|state| {
-                    state
-                        .user_take_over_reason()
-                        .is_some_and(UserTakeOverReason::is_stop)
-                        .then(|| active_block.ai_conversation_id())
-                })
-                .flatten();
-            let active_block_state = CtrlCActiveBlockState { is_long_running, is_agent_in_control_of_command, conversation_id_to_stop, };
-            ( has_block_list_selection, has_alt_screen_selection, active_block_state, )
-        };
-        // We don't want to copy blocks in AI input mode because those are context blocks.
-        let has_copiable_block_selection = !self.selected_blocks.is_empty()
-            && !self.ai_input_model.as_ref(ctx).is_ai_input_enabled();
+    //         let active_block = model.block_list().active_block();
+    //         let is_long_running = active_block.is_active_and_long_running();
+    //         let is_agent_in_control_of_command = active_block.is_agent_in_control();
+    //         let conversation_id_to_stop = active_block
+    //             .long_running_control_state()
+    //             .and_then(|state| {
+    //                 state
+    //                     .user_take_over_reason()
+    //                     .is_some_and(UserTakeOverReason::is_stop)
+    //                     .then(|| active_block.ai_conversation_id())
+    //             })
+    //             .flatten();
+    //         let active_block_state = CtrlCActiveBlockState { is_long_running, is_agent_in_control_of_command, conversation_id_to_stop, };
+    //         ( has_block_list_selection, has_alt_screen_selection, active_block_state, )
+    //     };
+    //     // We don't want to copy blocks in AI input mode because those are context blocks.
+    //     let has_copiable_block_selection = !self.selected_blocks.is_empty()
+    //         && !self.ai_input_model.as_ref(ctx).is_ai_input_enabled();
 
-        //let has_block_list_selection = true;  // testing
-        self.ctrl_c_internal( 
-            has_copiable_block_selection, 
-            has_block_list_selection, has_alt_screen_selection, 
-            active_block_state, 
-            ctx,
-         );
+    //     //let has_block_list_selection = true;  // testing
+    //     self.ctrl_c_internal( 
+    //         has_copiable_block_selection, 
+    //         has_block_list_selection, has_alt_screen_selection, 
+    //         active_block_state, 
+    //         ctx,
+    //      );
 
-        // We want to focus the input/rich content block if it is active.
-        self.redetermine_global_focus(ctx);
-        ctx.notify();
-    }
+    //     // We want to focus the input/rich content block if it is active.
+    //     self.redetermine_global_focus(ctx);
+    //     ctx.notify();
+    // }
 
-    // Glitcher - Enabled for all platforms
-    /// Copy if there is a selection. Otherwise, we defer to the normal ctrl-c  behaviour.
-    //    // if text is highlighted, calls self.copy() else calls self.ctrl_c_to_active_block()
-    // bug, copy() is not calling
-    // #[cfg(windows)]
-    fn ctrl_c_internal(
-        &mut self,
-        has_copiable_block_selection: bool,
-        has_block_list_selection: bool,
-        has_alt_screen_selection: bool,
-        active_block_state: CtrlCActiveBlockState,
-        ctx: &mut ViewContext<Self>, ) {
-            println!("ctrl_c_internal called");
-            println!("{} {} {}", has_block_list_selection, has_alt_screen_selection, has_copiable_block_selection);
-        if has_block_list_selection {             // If text is highlighted, copy
-            self.copy(ctx);
-            self.clear_selections_when_shell_mode_without_focusing_input(ctx);
-            return;
-        } else if has_alt_screen_selection {      // If text is highlighted, copy 
-            self.copy(ctx);
-            self.model.lock().alt_screen_mut().clear_selection();
-            return;
-        }  else if has_copiable_block_selection {   // If text is highlighted, copy 
-            // If there are blocks selected, we want to copy them but not prevent the normal ctrl-c behaviour.
-            self.copy(ctx);
-            self.clear_selections_when_shell_mode_without_focusing_input(ctx);
-        }
-        self.ctrl_c_to_active_block(active_block_state, ctx);
-    }
+    // // Glitcher - Enabled for all platforms
+    // /// Copy if there is a selection. Otherwise, we defer to the normal ctrl-c  behaviour.
+    // //    // if text is highlighted, calls self.copy() else calls self.ctrl_c_to_active_block()
+    // fn ctrl_c_internal(
+    //     &mut self,
+    //     has_copiable_block_selection: bool,
+    //     has_block_list_selection: bool,
+    //     has_alt_screen_selection: bool,
+    //     active_block_state: CtrlCActiveBlockState,
+    //     ctx: &mut ViewContext<Self>, ) {
+    //         println!("ctrl_c_internal called");
+    //         println!("{} {} {}", has_block_list_selection, has_alt_screen_selection, has_copiable_block_selection);
+    //     if has_block_list_selection {             // If text is highlighted, copy
+    //         self.copy(ctx);
+    //         self.clear_selections_when_shell_mode_without_focusing_input(ctx);
+    //         return;
+    //     } else if has_alt_screen_selection {      // If text is highlighted, copy 
+    //         self.copy(ctx);
+    //         self.model.lock().alt_screen_mut().clear_selection();
+    //         return;
+    //     }  else if has_copiable_block_selection {   // If text is highlighted, copy 
+    //         // If there are blocks selected, we want to copy them but not prevent the normal ctrl-c behaviour.
+    //         self.copy(ctx);
+    //         self.clear_selections_when_shell_mode_without_focusing_input(ctx);
+    //     }
+    //     self.ctrl_c_to_active_block(active_block_state, ctx);
+    // }
 
-    fn ctrl_c_to_active_block( &mut self, active_block_state: CtrlCActiveBlockState, ctx: &mut ViewContext<Self>, ) {
-        if active_block_state.is_agent_in_control_of_command {
-            self.cli_subagent_controller.update(ctx, |controller, ctx| {
-                controller.switch_control_to_user(
-                    UserTakeOverReason::Stop {
-                        should_auto_resume: true,
-                    },
-                    ctx,
-                );
-            });
-        } else if active_block_state.is_long_running {
-            // A second Ctrl+C after Stop takeover should cancel both the command and conversation.
-            if let Some(conversation_id) = active_block_state.conversation_id_to_stop {
-                self.stop_local_agent_conversation(conversation_id, ctx);
-            } else {
-                self.user_write_ctrl_c_to_pty(ctx);
-            }
-        } else {
-            self.maybe_handle_ctrl_c_in_rich_content_block(ctx);
-        }
-    }
+
 
     // // Glitcher - COMMENT THIS OUT - unify smart-c behavior - enable smart-c behavior on all platforms
     // #[cfg(not(windows))]
@@ -8971,6 +9041,7 @@ impl TerminalView {
     /// Warning: this should not be called when focusing the [`TerminalView`]. It could
     /// lead to a focus cycle because [`AIBlock::try_focus`] conditionally yields focus
     /// back to the [`TerminalView`].
+
     fn focus_ai_block_if_self_focused(
         &self,
         block: &ViewHandle<AIBlock>,
@@ -16581,10 +16652,9 @@ impl TerminalView {
         input_mode.is_inverted_blocklist()
     }
 
-    // runs when terminalAction:CtrlC - and text is highlighted
+    // Copies - runs when terminalAction:CtrlC - and text is highlighted
     fn copy(&mut self, ctx: &mut ViewContext<Self>) {
         // First check if there's selected text in the CLI subagent views
-        println!("Copy was called!");
         for subagent_view in self.cli_subagent_views.values() {
             if let Some(selected_text) = subagent_view.as_ref(ctx).selected_text(ctx) {
                 ctx.clipboard()
@@ -26452,7 +26522,7 @@ impl TerminalSurface for TerminalView {
     }
 }
 
-// Glitcher, handles action sent by smart ctrl-c TerminalAction::CtrlC
+// Glitcher, action_handler sent by smart ctrl-c TerminalAction::CtrlC
 impl TypedActionView for TerminalView {
     type Action = TerminalAction;
 
