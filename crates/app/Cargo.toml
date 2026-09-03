@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 # separate targets for each channel (stable, preview, dev) so we can # bundle with its own icon, app name, configuration (such as # flag overrides)
 # Otherwise these binaries are identical to main binary
+# Entry is src/bin/oss.rs for bin warp-oss
 [[bin]]
 name = "warp-oss"
 path = "src/bin/oss.rs"

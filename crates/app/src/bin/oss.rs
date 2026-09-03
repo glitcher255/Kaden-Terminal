@@ -6,7 +6,7 @@ use anyhow::Result;
 use warp_core::AppId;
 use warp_core::channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig};
 
-// Simple wrapper around warp::run() for Warp OSS builds.
+// Simple wrapper around warp::run() for Warp OSS builds. - Runs crates/app fn run() as its entry point
 fn main() -> Result<()> {
     let mut state = ChannelState::new(
         Channel::Oss,

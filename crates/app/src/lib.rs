@@ -340,9 +340,596 @@ use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 pub static ASSETS: warp_assets::Assets = warp_assets::Assets;
 const TUI_SECURE_STORAGE_SERVICE_SUFFIX: &str = ".tui";
 
-fn determine_agent_source(
-    launch_mode: &LaunchMode,
-) -> Option<crate::ai::ambient_agents::AgentSource> {
+
+// Glitcher - ENTRY POINT
+/// Runs the shared Warp executable as the app or as one of its command-line modes.
+///
+/// The bundled Warp Control wrapper injects `--warpctrl`, which is dispatched
+/// before the normal Warp/Oz parser. Oz subcommands are part of that normal
+/// parser and therefore do not require a separate mode flag.
+#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
+pub fn run() -> Result<()> {
+    // Perform any necessary platform-specific initialization.
+    platform::init();
+
+    // Ensure feature flags are initialized before parsing command-line arguments.
+    features::init_feature_flags();
+    if let Some(args) = warp_cli::local_control::ControlArgs::from_control_mode_env() {
+        #[cfg(windows)]
+        warp_util::windows::attach_to_parent_console();
+        warp_cli::local_control::run_and_exit(args);
+    }
+
+    // Parse command-line arguments.
+    let args = warp_cli::Args::from_env();
+
+    // Server URL overrides are only honored on internal dev channels. Release channels silently
+    // ignore `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
+    // `WARP_*` env-var equivalents) so shipped builds can't be redirected away from their
+    // baked-in server URLs. See `Channel::allows_server_url_overrides`.
+    if ChannelState::channel().allows_server_url_overrides() {
+        if let Some(url) = args.server_root_url()
+            && let Err(e) = ChannelState::override_server_root_url(url.to_owned())
+        {
+            eprintln!("Error: Invalid server root URL: {e:#}");
+        }
+
+        if let Some(url) = args.ws_server_url()
+            && let Err(e) = ChannelState::override_ws_server_url(url.to_owned())
+        {
+            eprintln!("Error: Invalid websocket server URL: {e:#}");
+        }
+
+        if let Some(url) = args.session_sharing_server_url()
+            && let Err(e) = ChannelState::override_session_sharing_server_url(url.to_owned())
+        {
+            eprintln!("Error: Invalid session sharing server URL: {e:#}");
+        }
+    }
+
+    if let Some(command) = args.command() {
+        #[cfg(windows)]
+        if command.prints_to_stdout() {
+            // We attach a console to ensure that all standard output gets printed correctly.
+            warp_util::windows::attach_to_parent_console();
+        }
+        match command {
+            warp_cli::Command::Worker(worker) => return run_worker_command(worker),
+            warp_cli::Command::Completions { shell } => {
+                return warp_cli::completions::generate_to_stdout(*shell);
+            }
+            warp_cli::Command::CommandLine(cmd) => {
+                let (is_sandboxed, computer_use_override) = match cmd.as_ref() {
+                    warp_cli::CliCommand::Agent(warp_cli::agent::AgentCommand::Run(run_args)) => (
+                        run_args.sandboxed,
+                        run_args.computer_use.computer_use_override(),
+                    ),
+                    _ => (false, None),
+                };
+
+                return run_internal(LaunchMode::CommandLine {
+                    command: cmd.as_ref().clone(),
+                    global_options: GlobalOptions {
+                        output_format: args.output_format(),
+                        api_key: args.api_key().cloned(),
+                    },
+                    debug: args.debug(),
+                    is_sandboxed,
+                    computer_use_override,
+                });
+            }
+            warp_cli::Command::DumpDebugInfo => {
+                return debug_dump::run();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            warp_cli::Command::DumpSettingsSchema { output_path } => {
+                return settings::schema_generation::dump_settings_schema(output_path.as_deref());
+            }
+            #[cfg(not(target_family = "wasm"))]
+            warp_cli::Command::PrintTelemetryEvents => {
+                return TelemetryEvent::print_telemetry_events_json();
+            }
+        }
+    }
+
+    // If running as a standalone CLI binary or invoked as "oz", print help
+    // instead of launching the GUI app.
+    let is_cli_binary = cfg!(feature = "standalone")
+        || warp_cli::binary_name().is_some_and(|name| name.starts_with("oz"))
+        || std::env::var_os("WARP_CLI_MODE").is_some();
+    if is_cli_binary {
+        warp_cli::Args::clap_command().print_help()?;
+        return Ok(());
+    }
+
+    let api_key = args.api_key().cloned();
+    run_internal(LaunchMode::App {
+        args: args.into_app_args(),
+        api_key,
+    })
+}
+
+/// Runs the app (or CLI / daemon). TUI entry points run after `initialize_app`
+/// in place of the GUI/CLI `launch()` path.
+fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
+    let mut timer = IntervalTimer::new();
+
+    // ── Early initialization (pre-AppBuilder) ──────────────────────
+    // These steps run before the platform event loop is started.
+    // They must not depend on AppContext.
+
+    #[cfg(windows)]
+    dynamic_libraries::configure_library_loading();
+
+    if launch_mode.needs_profiling() {
+        profiling::init();
+    }
+
+    // The `run` function already initializes feature flags, but ensure they're initialized here
+    // for other entrypoints.
+    features::init_feature_flags();
+
+    #[cfg(feature = "crash_reporting")]
+    if launch_mode.needs_crash_reporting() {
+        // Ensure that the main/root Sentry hub is initialized on the main
+        // thread.  PtySpawner creates a background thread to receive logs from
+        // the terminal server process, and we don't want it to be the host of
+        // the primary sentry::Hub.
+        sentry::Hub::main();
+    }
+
+    let mut tracing_initialization = launch_mode
+        .needs_profiling()
+        .then(tracing::init)
+        .transpose()?;
+
+    // Start the `run_internal` span here - we can't do it before this point
+    // because we need the tracing initialization to be complete first.
+    let span = ::tracing::info_span!(
+        "run_internal",
+        tags.cloud_agent = true,
+        launch_mode = launch_mode.as_str_for_tracing()
+    );
+    let _enter = span.enter();
+
+    let log_destination = launch_mode.log_destination();
+
+    cfg_if::cfg_if! {
+        if #[cfg(enable_crash_recovery)] {
+            if crash_recovery::is_crash_recovery_process(launch_mode.args().as_ref()) {
+                warp_logging::init_for_crash_recovery_process()?;
+            } else {
+                warp_logging::init(warp_logging::LogConfig {
+                    frontend: launch_mode.log_frontend(),
+                    log_destination,
+                    ..Default::default()
+                })?;
+            }
+        } else {
+            warp_logging::init(warp_logging::LogConfig {
+                frontend: launch_mode.log_frontend(),
+                log_destination,
+                ..Default::default()
+            })?;
+        }
+    }
+
+    if let Some(initialization) = tracing_initialization.as_mut() {
+        initialization.log_initialization_warning();
+    }
+    timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
+
+    // Claim a background-only process type before anything else can reach
+    // AppKit, so a headless launch never acquires a Dock tile. See APP-2946.
+    #[cfg(target_os = "macos")]
+    if launch_mode.is_headless()
+        && let Err(e) = platform::mac::mark_process_as_background_only()
+    {
+        log::warn!("Failed to mark process as background-only: {e:#}");
+    }
+
+    #[cfg(windows)]
+    platform::windows::check_redirection_guard();
+
+    // Adjust resource limits early, before doing other work, to ensure that any children we spawn (like the terminal server) inherit our adjusted rlimits.
+    resource_limits::adjust_resource_limits();
+
+    // For wasm builds we have this special case to parse out the intent from the url that is used to visite the app on web.
+    #[cfg(target_family = "wasm")]
+    {
+        use uri::web_intent_parser;
+        if let Some(intent) = web_intent_parser::parse_web_intent_from_current_url() {
+            launch_mode.add_url(intent);
+        }
+        web_intent_parser::set_context_flags_from_current_url();
+    }
+
+    // Collect errors that occur in run_internal() before the Sentry client is initialized,
+    // so they can be replayed to Sentry once it's ready.
+    #[cfg_attr(not(all(feature = "release_bundle",any(windows, any(target_os = "linux", target_os = "freebsd")))),
+        expect(unused_mut)
+    )]
+    let mut pre_sentry_errors: Vec<anyhow::Error> = Vec::new();
+
+    #[cfg(all(feature = "release_bundle",any(target_os = "linux", target_os = "freebsd")))]
+    if let LaunchMode::App { .. } = launch_mode {
+        match app_services::linux::pass_startup_args_to_existing_instance(
+            launch_mode.args().as_ref(),
+        ) {
+            // If we were able to contact an existing application instance, quit -
+            // we only want to run a single instance of Warp at a time.
+            Ok(_) => std::process::exit(0),
+            // If Warp isn't already running, we're good to go.
+            Err(app_services::linux::StartupArgsForwardingError::NoExistingInstance) => {}
+            // If we just finished an auto-update, we should continue running.
+            Err(app_services::linux::StartupArgsForwardingError::IgnoredAfterAutoUpdate) => {}
+            // If we were unable to perform the forwarding for an unknown reason,
+            // it's better to run a second instance than potentially end up in a
+            // state where Warp refuses to run even a first instance.
+            Err(err) => {
+                let err = anyhow::Error::from(err).context("Failed to forward startup args");
+                report_error!(&err);
+                pre_sentry_errors.push(err);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "release_bundle", windows))]
+    if let LaunchMode::App { .. } = launch_mode {
+        match app_services::windows::pass_startup_args_to_existing_instance(
+            launch_mode.args().as_ref(),
+        ) {
+            // If we were able to contact an existing application instance, quit -
+            // we only want to run a single instance of Warp at a time.
+            Ok(_) => std::process::exit(0),
+            // If Warp isn't already running, we're good to go.
+            Err(app_services::windows::StartupArgsForwardingError::NoExistingInstance) => {}
+            // If we just finished an auto-update, we should continue running.
+            Err(app_services::windows::StartupArgsForwardingError::IgnoredAfterAutoUpdate) => {}
+            // If we were unable to perform the forwarding for an unknown reason,
+            // it's better to run a second instance than potentially end up in a
+            // state where Warp refuses to run even a first instance.
+            Err(err) => {
+                let err = anyhow::Error::from(err).context("Failed to forward startup args");
+                report_error!(&err);
+                pre_sentry_errors.push(err);
+            }
+        }
+    }
+
+    // Sets up a Job Object that we associate with the Warp process to handle
+    // shared fate with its child processes. This should be called before we
+    // start spawning any child processes.
+    #[cfg(windows)]
+    command::windows::init();
+
+    // Establish the settings surface (GUI vs TUI) before initializing
+    // preferences so the settings infra selects the right file name and
+    // cloud-sync behavior for this launch mode.
+    ::settings::set_settings_mode(launch_mode.settings_mode());
+
+    let private_preferences = settings::init_private_user_preferences();
+    let (public_preferences, startup_toml_parse_error) = settings::init_public_user_preferences();
+
+    // When the SettingsFile feature flag is enabled, public settings live in
+    // the TOML-backed store. When disabled, they live in the platform-native
+    // store (same backend as private). Use the correct one for pre-app reads.
+    #[cfg_attr(
+        not(any(
+            enable_crash_recovery,
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "macos"
+        )),
+        expect(unused)
+    )]
+    let prefs_for_public_settings: &dyn warpui_extras::user_preferences::UserPreferences =
+        if FeatureFlag::SettingsFile.is_enabled() {
+            public_preferences.as_ref()
+        } else {
+            private_preferences.deref()
+        };
+
+    #[cfg(enable_crash_recovery)]
+    let crash_recovery =
+        crash_recovery::CrashRecovery::new(&launch_mode, prefs_for_public_settings);
+
+    // Set up the pty spawner before doing any meaningful work. We want to
+    // ensure that the process is in the cleanest possible state (minimal opened
+    // files, modified signal handlers, etc.) to avoid unexpected effects on
+    // spawned ptys.
+    //
+    #[cfg(feature = "local_tty")]
+    let pty_spawner =
+        terminal::local_tty::spawner::PtySpawner::new().context("Failed to create pty spawner")?;
+
+    // The TUI front-end skips the GUI lifecycle callbacks, which reach for
+    // windows and GUI-only state, but still flushes telemetry and reporting on
+    // termination.
+    let callbacks = if matches!(launch_mode, LaunchMode::Tui { .. }) {
+        let mut tracing_initialization = tracing_initialization.take();
+        warpui::platform::AppCallbacks {
+            on_will_terminate: Some(Box::new(move |ctx| {
+                TelemetryCollector::handle(ctx).update(ctx, |telemetry_collector, ctx| {
+                    telemetry_collector.flush_telemetry_events_for_shutdown(ctx);
+                });
+
+                profiling::teardown();
+                if let Some(initialization) = tracing_initialization.as_mut() {
+                    initialization.shutdown();
+                }
+
+                #[cfg(feature = "crash_reporting")]
+                crash_reporting::uninit_sentry();
+            })),
+            ..Default::default()
+        }
+    } else {
+        app_callbacks(
+            launch_mode.is_integration_test(),
+            tracing_initialization.take(),
+        )
+    };
+    let mut app_builder = if launch_mode.is_headless() {
+        warpui::platform::AppBuilder::new_headless(
+            callbacks,
+            Box::new(ASSETS),
+            launch_mode.take_test_driver(),
+        )
+    } else {
+        warpui::platform::AppBuilder::new(
+            callbacks,
+            Box::new(ASSETS),
+            launch_mode.take_test_driver(),
+        )
+    };
+
+    if matches!(launch_mode, LaunchMode::Tui { .. }) {
+        app_builder.enable_headless_microphone_access_query();
+    }
+
+    // A headless invocation has no Dock presence, so it performs no Dock-visible
+    // setup at all (Dock icon, Dock menu, menu bar). See APP-2946.
+    #[cfg(target_os = "macos")]
+    if !launch_mode.is_headless() {
+        use warpui::AssetProvider as _;
+        use warpui::platform::mac::AppExt;
+
+        let activate_on_launch = !launch_mode.is_integration_test()
+            || std::env::var("WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS").is_ok();
+        app_builder.set_activate_on_launch(activate_on_launch);
+
+        let dev_icon = ASSETS.get("bundled/png/local.png")?;
+        app_builder.set_dev_icon(dev_icon);
+
+        let show_dock_icon = crate::settings::app_icon::ShowDockIconState::read_from_preferences(
+            prefs_for_public_settings,
+        )
+        .unwrap_or_else(crate::settings::app_icon::ShowDockIconState::default_value);
+        app_builder.set_show_dock_icon_on_launch(show_dock_icon);
+        app_builder.set_menu_bar_builder(app_menus::menu_bar);
+        app_builder.set_dock_menu_builder(|_| app_menus::dock_menu());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        use warpui::platform::linux::{self, AppBuilderExt};
+
+        use crate::settings::ForceX11;
+
+        app_builder.set_window_class(ChannelState::app_id().to_string());
+
+        let force_x11 = ForceX11::read_from_preferences(prefs_for_public_settings)
+            .unwrap_or(ForceX11::default_value());
+        // Force use of wayland if the user has passed the `WARP_ENABLE_WAYLAND` env var.
+        let allow_wayland = linux::is_wayland_env_var_set() || !force_x11;
+        app_builder.force_x11(!allow_wayland);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use warpui::platform::windows::AppBuilderExt;
+        app_builder.set_app_user_model_id(ChannelState::app_id().to_string());
+
+        // Only use DXC for DirectX shader compilation if we're not running in a Parallels VM
+        // Parallels VMs can have issues with DXC shader compilation
+        let is_parallels_vm = crate::util::vm_detection::is_running_in_windows_parallels_vm();
+        if !is_parallels_vm {
+            log::info!("Using DXC for DirectX shader compilation");
+            use warpui::platform::windows::DXCPath;
+
+            app_builder.use_dxc_for_directx_shader_compilation(DXCPath {
+                dxc_path: "dxcompiler.dll".to_string(),
+                dxil_path: "dxil.dll".to_string(),
+            });
+        } else {
+            log::info!("Skipping DXC for DirectX shader compilation; running in a Parallels VM");
+        }
+    }
+
+    // Override any bindings that have a `Custom` trigger to a `Keystroke`-based trigger. In theory,
+    // this should be a noop on Mac (since the keystrokes registered via the  Mac menus first
+    // intercept the binding), but just to be safe we only enable this in cases where we don't
+    // include mac menus.
+    #[cfg(not(target_os = "macos"))]
+    app_builder.convert_custom_triggers_to_keystroke_triggers(
+        crate::util::bindings::custom_tag_to_keystroke,
+    );
+
+    #[cfg(target_os = "macos")]
+    app_builder.register_default_keystroke_triggers_for_custom_actions(
+        crate::util::bindings::custom_tag_to_keystroke,
+    );
+
+    app_builder.run(move |ctx| {
+        #[cfg(not(target_family = "wasm"))]
+        // Rotate the log files in the background.
+        ctx.background_executor()
+            .spawn(warp_logging::rotate_log_files())
+            .detach();
+
+        ctx.add_singleton_model(|ctx| {
+            AppExecutionMode::new(
+                launch_mode.execution_mode(),
+                launch_mode.is_sandboxed(),
+                ctx,
+            )
+        });
+        #[cfg(feature = "crash_reporting")]
+        crate::crash_reporting::set_client_type_tag(launch_mode.execution_mode().client_id());
+
+        // Add the terminal server singleton to the application.
+        #[cfg(feature = "local_tty")]
+        ctx.add_singleton_model(move |_ctx| pty_spawner);
+
+        // Register user preferences.  This must be done before initializing
+        // feature flags or experiments, both of which check user preferences for
+        // overrides.
+        ctx.add_singleton_model(move |_ctx| ::settings::PublicPreferences::new(public_preferences));
+        ctx.add_singleton_model(move |_ctx| private_preferences);
+        let startup_toml_parse_error = startup_toml_parse_error;
+
+        #[cfg(enable_crash_recovery)]
+        ctx.add_singleton_model(move |_ctx| crash_recovery);
+
+        #[cfg(feature = "plugin_host")]
+        ctx.add_singleton_model(move |ctx| {
+            plugin::PluginHost::new(ctx).expect("Could not instantiate PluginHost")
+        });
+        let app_state = initialize_app(
+            &launch_mode,
+            timer,
+            startup_toml_parse_error,
+            ctx,
+            pre_sentry_errors,
+        );
+
+        if ImprovedPaletteSearch::improved_search_enabled(ctx) {
+            FeatureFlag::UseTantivySearch.set_enabled(true);
+        }
+
+        // The TUI front-end reuses the full `initialize_app` bootstrap above (so
+        // auth, `Appearance`, settings, etc. exist), then runs the device-login
+        // flow and mounts the TUI (via `crate::tui::init`) instead of the
+        // GUI/CLI `launch()` path.
+        match launch_mode {
+            #[cfg(feature = "tui")]
+            LaunchMode::Tui { entrypoint } => match entrypoint {
+                TuiEntryPoint::Interactive { mount, .. } => crate::tui::init(mount, ctx),
+                TuiEntryPoint::CliCommand { execute } => execute(ctx),
+            },
+            #[cfg(not(feature = "tui"))]
+            LaunchMode::Tui { .. } => {
+                unreachable!("the `tui` launch mode requires the `tui` feature")
+            }
+            other => launch(ctx, app_state, other),
+        }
+    })
+}
+
+
+// App launch
+#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
+fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode: LaunchMode) {
+    IntervalTimer::handle(ctx).update(ctx, |timer, _ctx| {
+        timer.mark_interval_end("APP_LAUNCHED");
+    });
+
+    keyboard::load_custom_keybindings(ctx);
+
+    IntervalTimer::handle(ctx).update(ctx, |timer, _ctx| {
+        timer.mark_interval_end("KEYBINDINGS_LOADED");
+    });
+
+    // For now, we only specify application-level fallback fonts on web.
+    #[cfg(target_family = "wasm")]
+    ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
+
+    match launch_mode {
+        // The TUI front-end runs its own mount in the run closure and returns
+        // before reaching launch().
+        LaunchMode::Tui { .. } => unreachable!("LaunchMode::Tui is handled before launch()"),
+        LaunchMode::App { .. } | LaunchMode::Test { .. } => {
+            let should_skip_restore = launch_mode
+                .args()
+                .urls
+                .iter()
+                .any(is_cloud_agent_web_home_launch_url);
+            let app_state = if should_skip_restore { None } else { app_state };
+            // Attempt to restore windows from the persisted application state.
+            let arg = OpenFromRestoredArg { app_state };
+            ctx.dispatch_global_action("root_view:open_from_restored", &arg);
+
+            // Process any URLs that were provided on the command line (which may be
+            // file:// URLs or ones using our custom URL scheme).
+            for url in launch_mode.args().urls.iter() {
+                uri::handle_incoming_uri(url, ctx);
+            }
+
+            // If, after session restoration and command-line argument handling, we
+            // haven't opened any windows, open a new window.
+            if ctx.window_ids().count() == 0 {
+                ctx.dispatch_global_action("root_view:open_new", &());
+            }
+
+            IntervalTimer::handle(ctx).update(ctx, |timer, _| {
+                timer.mark_interval_end("WINDOWS_CREATED");
+            });
+
+            // TODO(ben): We should skip this for LaunchMode::Test.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                use crate::login_item::maybe_register_app_as_login_item;
+                use crate::terminal::general_settings::GeneralSettingsChangedEvent;
+                // Note that we put this here because it depends on settings already having been initialized.
+                ctx.subscribe_to_model(&GeneralSettings::handle(ctx), |_, event, ctx| {
+                    if matches!(event, GeneralSettingsChangedEvent::LoginItem { .. }) {
+                        maybe_register_app_as_login_item(ctx);
+                    }
+                });
+                maybe_register_app_as_login_item(ctx);
+            }
+        }
+        #[cfg_attr(target_family = "wasm", allow(unused_variables))]
+        LaunchMode::CommandLine {
+            command,
+            global_options,
+            ..
+        } => {
+            cfg_if::cfg_if! {
+                if #[cfg(target_family = "wasm")] {
+                    panic!("Cannot execute CLI command {command:?} on the web");
+                } else {
+                    if let Err(err) = crate::ai::agent_sdk::run(ctx, command.clone(), global_options.clone()) {
+                        eprintln!("{err:#}");
+                        report_error!(err);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        // Proxy should never reach launch() — it's a thin byte bridge.
+        LaunchMode::RemoteServerProxy => {
+            report_error!("Proxy mode should not use the launch() path");
+            std::process::exit(1);
+        }
+        // Daemon: bind the Unix socket and register the ServerModel.
+        // initialize_app already set up everything else including crash
+        // reporting.
+        #[cfg(unix)]
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            remote_server::unix::launch_daemon(&identity_key, ctx);
+        }
+        #[cfg(not(unix))]
+        LaunchMode::RemoteServerDaemon { .. } => {
+            report_error!("RemoteServerDaemon is not supported on this platform");
+            std::process::exit(1);
+        }
+    }
+}
+
+
+fn determine_agent_source( launch_mode: &LaunchMode, ) -> Option<crate::ai::ambient_agents::AgentSource> {
     match launch_mode {
         LaunchMode::CommandLine { .. } => {
             if std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true") {
@@ -736,112 +1323,7 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
     }
 }
 
-/// Runs the shared Warp executable as the app or as one of its command-line modes.
-///
-/// The bundled Warp Control wrapper injects `--warpctrl`, which is dispatched
-/// before the normal Warp/Oz parser. Oz subcommands are part of that normal
-/// parser and therefore do not require a separate mode flag.
-#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
-pub fn run() -> Result<()> {
-    // Perform any necessary platform-specific initialization.
-    platform::init();
 
-    // Ensure feature flags are initialized before parsing command-line arguments.
-    features::init_feature_flags();
-    if let Some(args) = warp_cli::local_control::ControlArgs::from_control_mode_env() {
-        #[cfg(windows)]
-        warp_util::windows::attach_to_parent_console();
-        warp_cli::local_control::run_and_exit(args);
-    }
-
-    // Parse command-line arguments.
-    let args = warp_cli::Args::from_env();
-
-    // Server URL overrides are only honored on internal dev channels. Release channels silently
-    // ignore `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
-    // `WARP_*` env-var equivalents) so shipped builds can't be redirected away from their
-    // baked-in server URLs. See `Channel::allows_server_url_overrides`.
-    if ChannelState::channel().allows_server_url_overrides() {
-        if let Some(url) = args.server_root_url()
-            && let Err(e) = ChannelState::override_server_root_url(url.to_owned())
-        {
-            eprintln!("Error: Invalid server root URL: {e:#}");
-        }
-
-        if let Some(url) = args.ws_server_url()
-            && let Err(e) = ChannelState::override_ws_server_url(url.to_owned())
-        {
-            eprintln!("Error: Invalid websocket server URL: {e:#}");
-        }
-
-        if let Some(url) = args.session_sharing_server_url()
-            && let Err(e) = ChannelState::override_session_sharing_server_url(url.to_owned())
-        {
-            eprintln!("Error: Invalid session sharing server URL: {e:#}");
-        }
-    }
-
-    if let Some(command) = args.command() {
-        #[cfg(windows)]
-        if command.prints_to_stdout() {
-            // We attach a console to ensure that all standard output gets printed correctly.
-            warp_util::windows::attach_to_parent_console();
-        }
-        match command {
-            warp_cli::Command::Worker(worker) => return run_worker_command(worker),
-            warp_cli::Command::Completions { shell } => {
-                return warp_cli::completions::generate_to_stdout(*shell);
-            }
-            warp_cli::Command::CommandLine(cmd) => {
-                let (is_sandboxed, computer_use_override) = match cmd.as_ref() {
-                    warp_cli::CliCommand::Agent(warp_cli::agent::AgentCommand::Run(run_args)) => (
-                        run_args.sandboxed,
-                        run_args.computer_use.computer_use_override(),
-                    ),
-                    _ => (false, None),
-                };
-
-                return run_internal(LaunchMode::CommandLine {
-                    command: cmd.as_ref().clone(),
-                    global_options: GlobalOptions {
-                        output_format: args.output_format(),
-                        api_key: args.api_key().cloned(),
-                    },
-                    debug: args.debug(),
-                    is_sandboxed,
-                    computer_use_override,
-                });
-            }
-            warp_cli::Command::DumpDebugInfo => {
-                return debug_dump::run();
-            }
-            #[cfg(not(target_family = "wasm"))]
-            warp_cli::Command::DumpSettingsSchema { output_path } => {
-                return settings::schema_generation::dump_settings_schema(output_path.as_deref());
-            }
-            #[cfg(not(target_family = "wasm"))]
-            warp_cli::Command::PrintTelemetryEvents => {
-                return TelemetryEvent::print_telemetry_events_json();
-            }
-        }
-    }
-
-    // If running as a standalone CLI binary or invoked as "oz", print help
-    // instead of launching the GUI app.
-    let is_cli_binary = cfg!(feature = "standalone")
-        || warp_cli::binary_name().is_some_and(|name| name.starts_with("oz"))
-        || std::env::var_os("WARP_CLI_MODE").is_some();
-    if is_cli_binary {
-        warp_cli::Args::clap_command().print_help()?;
-        return Ok(());
-    }
-
-    let api_key = args.api_key().cloned();
-    run_internal(LaunchMode::App {
-        args: args.into_app_args(),
-        api_key,
-    })
-}
 
 /// Runs a parsed Warp worker command.
 fn run_worker_command(worker: &warp_cli::WorkerCommand) -> Result<()> {
@@ -975,393 +1457,7 @@ pub fn run_tui_worker_if_requested() -> Option<Result<()>> {
 /// `initialize_app` to build the root TUI view and start the TUI driver.
 pub type TuiMountFn = Box<dyn FnOnce(&mut warpui::AppContext)>;
 
-/// Runs the app (or CLI / daemon). TUI entry points run after `initialize_app`
-/// in place of the GUI/CLI `launch()` path.
-fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
-    let mut timer = IntervalTimer::new();
 
-    // ── Early initialization (pre-AppBuilder) ──────────────────────
-    // These steps run before the platform event loop is started.
-    // They must not depend on AppContext.
-
-    #[cfg(windows)]
-    dynamic_libraries::configure_library_loading();
-
-    if launch_mode.needs_profiling() {
-        profiling::init();
-    }
-
-    // The `run` function already initializes feature flags, but ensure they're initialized here
-    // for other entrypoints.
-    features::init_feature_flags();
-
-    #[cfg(feature = "crash_reporting")]
-    if launch_mode.needs_crash_reporting() {
-        // Ensure that the main/root Sentry hub is initialized on the main
-        // thread.  PtySpawner creates a background thread to receive logs from
-        // the terminal server process, and we don't want it to be the host of
-        // the primary sentry::Hub.
-        sentry::Hub::main();
-    }
-
-    let mut tracing_initialization = launch_mode
-        .needs_profiling()
-        .then(tracing::init)
-        .transpose()?;
-
-    // Start the `run_internal` span here - we can't do it before this point
-    // because we need the tracing initialization to be complete first.
-    let span = ::tracing::info_span!(
-        "run_internal",
-        tags.cloud_agent = true,
-        launch_mode = launch_mode.as_str_for_tracing()
-    );
-    let _enter = span.enter();
-
-    let log_destination = launch_mode.log_destination();
-
-    cfg_if::cfg_if! {
-        if #[cfg(enable_crash_recovery)] {
-            if crash_recovery::is_crash_recovery_process(launch_mode.args().as_ref()) {
-                warp_logging::init_for_crash_recovery_process()?;
-            } else {
-                warp_logging::init(warp_logging::LogConfig {
-                    frontend: launch_mode.log_frontend(),
-                    log_destination,
-                    ..Default::default()
-                })?;
-            }
-        } else {
-            warp_logging::init(warp_logging::LogConfig {
-                frontend: launch_mode.log_frontend(),
-                log_destination,
-                ..Default::default()
-            })?;
-        }
-    }
-
-    if let Some(initialization) = tracing_initialization.as_mut() {
-        initialization.log_initialization_warning();
-    }
-    timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
-
-    // Claim a background-only process type before anything else can reach
-    // AppKit, so a headless launch never acquires a Dock tile. See APP-2946.
-    #[cfg(target_os = "macos")]
-    if launch_mode.is_headless()
-        && let Err(e) = platform::mac::mark_process_as_background_only()
-    {
-        log::warn!("Failed to mark process as background-only: {e:#}");
-    }
-
-    #[cfg(windows)]
-    platform::windows::check_redirection_guard();
-
-    // Adjust resource limits early, before doing other work, to ensure that
-    // any children we spawn (like the terminal server) inherit our adjusted
-    // rlimits.
-    resource_limits::adjust_resource_limits();
-
-    // For wasm builds we have this special case to parse out the intent
-    // from the url that is used to visite the app on web.
-    #[cfg(target_family = "wasm")]
-    {
-        use uri::web_intent_parser;
-        if let Some(intent) = web_intent_parser::parse_web_intent_from_current_url() {
-            launch_mode.add_url(intent);
-        }
-        web_intent_parser::set_context_flags_from_current_url();
-    }
-
-    // Collect errors that occur in run_internal() before the Sentry client is initialized,
-    // so they can be replayed to Sentry once it's ready.
-    #[cfg_attr(
-        not(all(
-            feature = "release_bundle",
-            any(windows, any(target_os = "linux", target_os = "freebsd"))
-        )),
-        expect(unused_mut)
-    )]
-    let mut pre_sentry_errors: Vec<anyhow::Error> = Vec::new();
-
-    #[cfg(all(
-        feature = "release_bundle",
-        any(target_os = "linux", target_os = "freebsd")
-    ))]
-    if let LaunchMode::App { .. } = launch_mode {
-        match app_services::linux::pass_startup_args_to_existing_instance(
-            launch_mode.args().as_ref(),
-        ) {
-            // If we were able to contact an existing application instance, quit -
-            // we only want to run a single instance of Warp at a time.
-            Ok(_) => std::process::exit(0),
-            // If Warp isn't already running, we're good to go.
-            Err(app_services::linux::StartupArgsForwardingError::NoExistingInstance) => {}
-            // If we just finished an auto-update, we should continue running.
-            Err(app_services::linux::StartupArgsForwardingError::IgnoredAfterAutoUpdate) => {}
-            // If we were unable to perform the forwarding for an unknown reason,
-            // it's better to run a second instance than potentially end up in a
-            // state where Warp refuses to run even a first instance.
-            Err(err) => {
-                let err = anyhow::Error::from(err).context("Failed to forward startup args");
-                report_error!(&err);
-                pre_sentry_errors.push(err);
-            }
-        }
-    }
-
-    #[cfg(all(feature = "release_bundle", windows))]
-    if let LaunchMode::App { .. } = launch_mode {
-        match app_services::windows::pass_startup_args_to_existing_instance(
-            launch_mode.args().as_ref(),
-        ) {
-            // If we were able to contact an existing application instance, quit -
-            // we only want to run a single instance of Warp at a time.
-            Ok(_) => std::process::exit(0),
-            // If Warp isn't already running, we're good to go.
-            Err(app_services::windows::StartupArgsForwardingError::NoExistingInstance) => {}
-            // If we just finished an auto-update, we should continue running.
-            Err(app_services::windows::StartupArgsForwardingError::IgnoredAfterAutoUpdate) => {}
-            // If we were unable to perform the forwarding for an unknown reason,
-            // it's better to run a second instance than potentially end up in a
-            // state where Warp refuses to run even a first instance.
-            Err(err) => {
-                let err = anyhow::Error::from(err).context("Failed to forward startup args");
-                report_error!(&err);
-                pre_sentry_errors.push(err);
-            }
-        }
-    }
-
-    // Sets up a Job Object that we associate with the Warp process to handle
-    // shared fate with its child processes. This should be called before we
-    // start spawning any child processes.
-    #[cfg(windows)]
-    command::windows::init();
-
-    // Establish the settings surface (GUI vs TUI) before initializing
-    // preferences so the settings infra selects the right file name and
-    // cloud-sync behavior for this launch mode.
-    ::settings::set_settings_mode(launch_mode.settings_mode());
-
-    let private_preferences = settings::init_private_user_preferences();
-    let (public_preferences, startup_toml_parse_error) = settings::init_public_user_preferences();
-
-    // When the SettingsFile feature flag is enabled, public settings live in
-    // the TOML-backed store. When disabled, they live in the platform-native
-    // store (same backend as private). Use the correct one for pre-app reads.
-    #[cfg_attr(
-        not(any(
-            enable_crash_recovery,
-            target_os = "linux",
-            target_os = "freebsd",
-            target_os = "macos"
-        )),
-        expect(unused)
-    )]
-    let prefs_for_public_settings: &dyn warpui_extras::user_preferences::UserPreferences =
-        if FeatureFlag::SettingsFile.is_enabled() {
-            public_preferences.as_ref()
-        } else {
-            private_preferences.deref()
-        };
-
-    #[cfg(enable_crash_recovery)]
-    let crash_recovery =
-        crash_recovery::CrashRecovery::new(&launch_mode, prefs_for_public_settings);
-
-    // Set up the pty spawner before doing any meaningful work. We want to
-    // ensure that the process is in the cleanest possible state (minimal opened
-    // files, modified signal handlers, etc.) to avoid unexpected effects on
-    // spawned ptys.
-    //
-    #[cfg(feature = "local_tty")]
-    let pty_spawner =
-        terminal::local_tty::spawner::PtySpawner::new().context("Failed to create pty spawner")?;
-
-    // The TUI front-end skips the GUI lifecycle callbacks, which reach for
-    // windows and GUI-only state, but still flushes telemetry and reporting on
-    // termination.
-    let callbacks = if matches!(launch_mode, LaunchMode::Tui { .. }) {
-        let mut tracing_initialization = tracing_initialization.take();
-        warpui::platform::AppCallbacks {
-            on_will_terminate: Some(Box::new(move |ctx| {
-                TelemetryCollector::handle(ctx).update(ctx, |telemetry_collector, ctx| {
-                    telemetry_collector.flush_telemetry_events_for_shutdown(ctx);
-                });
-
-                profiling::teardown();
-                if let Some(initialization) = tracing_initialization.as_mut() {
-                    initialization.shutdown();
-                }
-
-                #[cfg(feature = "crash_reporting")]
-                crash_reporting::uninit_sentry();
-            })),
-            ..Default::default()
-        }
-    } else {
-        app_callbacks(
-            launch_mode.is_integration_test(),
-            tracing_initialization.take(),
-        )
-    };
-    let mut app_builder = if launch_mode.is_headless() {
-        warpui::platform::AppBuilder::new_headless(
-            callbacks,
-            Box::new(ASSETS),
-            launch_mode.take_test_driver(),
-        )
-    } else {
-        warpui::platform::AppBuilder::new(
-            callbacks,
-            Box::new(ASSETS),
-            launch_mode.take_test_driver(),
-        )
-    };
-
-    if matches!(launch_mode, LaunchMode::Tui { .. }) {
-        app_builder.enable_headless_microphone_access_query();
-    }
-
-    // A headless invocation has no Dock presence, so it performs no Dock-visible
-    // setup at all (Dock icon, Dock menu, menu bar). See APP-2946.
-    #[cfg(target_os = "macos")]
-    if !launch_mode.is_headless() {
-        use warpui::AssetProvider as _;
-        use warpui::platform::mac::AppExt;
-
-        let activate_on_launch = !launch_mode.is_integration_test()
-            || std::env::var("WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS").is_ok();
-        app_builder.set_activate_on_launch(activate_on_launch);
-
-        let dev_icon = ASSETS.get("bundled/png/local.png")?;
-        app_builder.set_dev_icon(dev_icon);
-
-        let show_dock_icon = crate::settings::app_icon::ShowDockIconState::read_from_preferences(
-            prefs_for_public_settings,
-        )
-        .unwrap_or_else(crate::settings::app_icon::ShowDockIconState::default_value);
-        app_builder.set_show_dock_icon_on_launch(show_dock_icon);
-        app_builder.set_menu_bar_builder(app_menus::menu_bar);
-        app_builder.set_dock_menu_builder(|_| app_menus::dock_menu());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    {
-        use warpui::platform::linux::{self, AppBuilderExt};
-
-        use crate::settings::ForceX11;
-
-        app_builder.set_window_class(ChannelState::app_id().to_string());
-
-        let force_x11 = ForceX11::read_from_preferences(prefs_for_public_settings)
-            .unwrap_or(ForceX11::default_value());
-        // Force use of wayland if the user has passed the `WARP_ENABLE_WAYLAND` env var.
-        let allow_wayland = linux::is_wayland_env_var_set() || !force_x11;
-        app_builder.force_x11(!allow_wayland);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use warpui::platform::windows::AppBuilderExt;
-        app_builder.set_app_user_model_id(ChannelState::app_id().to_string());
-
-        // Only use DXC for DirectX shader compilation if we're not running in a Parallels VM
-        // Parallels VMs can have issues with DXC shader compilation
-        let is_parallels_vm = crate::util::vm_detection::is_running_in_windows_parallels_vm();
-        if !is_parallels_vm {
-            log::info!("Using DXC for DirectX shader compilation");
-            use warpui::platform::windows::DXCPath;
-
-            app_builder.use_dxc_for_directx_shader_compilation(DXCPath {
-                dxc_path: "dxcompiler.dll".to_string(),
-                dxil_path: "dxil.dll".to_string(),
-            });
-        } else {
-            log::info!("Skipping DXC for DirectX shader compilation; running in a Parallels VM");
-        }
-    }
-
-    // Override any bindings that have a `Custom` trigger to a `Keystroke`-based trigger. In theory,
-    // this should be a noop on Mac (since the keystrokes registered via the  Mac menus first
-    // intercept the binding), but just to be safe we only enable this in cases where we don't
-    // include mac menus.
-    #[cfg(not(target_os = "macos"))]
-    app_builder.convert_custom_triggers_to_keystroke_triggers(
-        crate::util::bindings::custom_tag_to_keystroke,
-    );
-
-    #[cfg(target_os = "macos")]
-    app_builder.register_default_keystroke_triggers_for_custom_actions(
-        crate::util::bindings::custom_tag_to_keystroke,
-    );
-
-    app_builder.run(move |ctx| {
-        #[cfg(not(target_family = "wasm"))]
-        // Rotate the log files in the background.
-        ctx.background_executor()
-            .spawn(warp_logging::rotate_log_files())
-            .detach();
-
-        ctx.add_singleton_model(|ctx| {
-            AppExecutionMode::new(
-                launch_mode.execution_mode(),
-                launch_mode.is_sandboxed(),
-                ctx,
-            )
-        });
-        #[cfg(feature = "crash_reporting")]
-        crate::crash_reporting::set_client_type_tag(launch_mode.execution_mode().client_id());
-
-        // Add the terminal server singleton to the application.
-        #[cfg(feature = "local_tty")]
-        ctx.add_singleton_model(move |_ctx| pty_spawner);
-
-        // Register user preferences.  This must be done before initializing
-        // feature flags or experiments, both of which check user preferences for
-        // overrides.
-        ctx.add_singleton_model(move |_ctx| ::settings::PublicPreferences::new(public_preferences));
-        ctx.add_singleton_model(move |_ctx| private_preferences);
-        let startup_toml_parse_error = startup_toml_parse_error;
-
-        #[cfg(enable_crash_recovery)]
-        ctx.add_singleton_model(move |_ctx| crash_recovery);
-
-        #[cfg(feature = "plugin_host")]
-        ctx.add_singleton_model(move |ctx| {
-            plugin::PluginHost::new(ctx).expect("Could not instantiate PluginHost")
-        });
-        let app_state = initialize_app(
-            &launch_mode,
-            timer,
-            startup_toml_parse_error,
-            ctx,
-            pre_sentry_errors,
-        );
-
-        if ImprovedPaletteSearch::improved_search_enabled(ctx) {
-            FeatureFlag::UseTantivySearch.set_enabled(true);
-        }
-
-        // The TUI front-end reuses the full `initialize_app` bootstrap above (so
-        // auth, `Appearance`, settings, etc. exist), then runs the device-login
-        // flow and mounts the TUI (via `crate::tui::init`) instead of the
-        // GUI/CLI `launch()` path.
-        match launch_mode {
-            #[cfg(feature = "tui")]
-            LaunchMode::Tui { entrypoint } => match entrypoint {
-                TuiEntryPoint::Interactive { mount, .. } => crate::tui::init(mount, ctx),
-                TuiEntryPoint::CliCommand { execute } => execute(ctx),
-            },
-            #[cfg(not(feature = "tui"))]
-            LaunchMode::Tui { .. } => {
-                unreachable!("the `tui` launch mode requires the `tui` feature")
-            }
-            other => launch(ctx, app_state, other),
-        }
-    })
-}
 
 pub struct UpdateQuakeModeEventArg {
     active_window_id: Option<WindowId>,
@@ -3070,104 +3166,6 @@ fn is_cloud_agent_web_home_launch_url(url: &Url) -> bool {
             .any(|(key, value)| key == "source" && value == "web_home")
 }
 
-#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
-fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode: LaunchMode) {
-    IntervalTimer::handle(ctx).update(ctx, |timer, _ctx| {
-        timer.mark_interval_end("APP_LAUNCHED");
-    });
-
-    keyboard::load_custom_keybindings(ctx);
-
-    IntervalTimer::handle(ctx).update(ctx, |timer, _ctx| {
-        timer.mark_interval_end("KEYBINDINGS_LOADED");
-    });
-
-    // For now, we only specify application-level fallback fonts on web.
-    #[cfg(target_family = "wasm")]
-    ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
-
-    match launch_mode {
-        // The TUI front-end runs its own mount in the run closure and returns
-        // before reaching launch().
-        LaunchMode::Tui { .. } => unreachable!("LaunchMode::Tui is handled before launch()"),
-        LaunchMode::App { .. } | LaunchMode::Test { .. } => {
-            let should_skip_restore = launch_mode
-                .args()
-                .urls
-                .iter()
-                .any(is_cloud_agent_web_home_launch_url);
-            let app_state = if should_skip_restore { None } else { app_state };
-            // Attempt to restore windows from the persisted application state.
-            let arg = OpenFromRestoredArg { app_state };
-            ctx.dispatch_global_action("root_view:open_from_restored", &arg);
-
-            // Process any URLs that were provided on the command line (which may be
-            // file:// URLs or ones using our custom URL scheme).
-            for url in launch_mode.args().urls.iter() {
-                uri::handle_incoming_uri(url, ctx);
-            }
-
-            // If, after session restoration and command-line argument handling, we
-            // haven't opened any windows, open a new window.
-            if ctx.window_ids().count() == 0 {
-                ctx.dispatch_global_action("root_view:open_new", &());
-            }
-
-            IntervalTimer::handle(ctx).update(ctx, |timer, _| {
-                timer.mark_interval_end("WINDOWS_CREATED");
-            });
-
-            // TODO(ben): We should skip this for LaunchMode::Test.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            {
-                use crate::login_item::maybe_register_app_as_login_item;
-                use crate::terminal::general_settings::GeneralSettingsChangedEvent;
-                // Note that we put this here because it depends on settings already having been initialized.
-                ctx.subscribe_to_model(&GeneralSettings::handle(ctx), |_, event, ctx| {
-                    if matches!(event, GeneralSettingsChangedEvent::LoginItem { .. }) {
-                        maybe_register_app_as_login_item(ctx);
-                    }
-                });
-                maybe_register_app_as_login_item(ctx);
-            }
-        }
-        #[cfg_attr(target_family = "wasm", allow(unused_variables))]
-        LaunchMode::CommandLine {
-            command,
-            global_options,
-            ..
-        } => {
-            cfg_if::cfg_if! {
-                if #[cfg(target_family = "wasm")] {
-                    panic!("Cannot execute CLI command {command:?} on the web");
-                } else {
-                    if let Err(err) = crate::ai::agent_sdk::run(ctx, command.clone(), global_options.clone()) {
-                        eprintln!("{err:#}");
-                        report_error!(err);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-        // Proxy should never reach launch() — it's a thin byte bridge.
-        LaunchMode::RemoteServerProxy => {
-            report_error!("Proxy mode should not use the launch() path");
-            std::process::exit(1);
-        }
-        // Daemon: bind the Unix socket and register the ServerModel.
-        // initialize_app already set up everything else including crash
-        // reporting.
-        #[cfg(unix)]
-        LaunchMode::RemoteServerDaemon { identity_key } => {
-            remote_server::unix::launch_daemon(&identity_key, ctx);
-        }
-        #[cfg(not(unix))]
-        LaunchMode::RemoteServerDaemon { .. } => {
-            report_error!("RemoteServerDaemon is not supported on this platform");
-            std::process::exit(1);
-        }
-    }
-}
 
 /// Initializes the logger before running tests.
 ///
