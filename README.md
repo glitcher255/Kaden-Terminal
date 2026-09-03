@@ -9,7 +9,7 @@ Kaden is a clean feature rich Terminal Emulator where Ctrl+C copies text, Ctrl+A
 
 ## Why Kaden?
 
-- **Hotkeys:** Configurable keybindings full clipboard support and smart Ctrl+C to copy / kill, no more using your mouse to select your code or ctrl-shift-c.
+- **Hotkeys:** Configurable keybindings with full clipboard support and smart Ctrl+C to copy / kill, no more using your mouse to select your code or ctrl-shift-c.
 - **Zero bloat:** No AI, sign in, account, cloud or drive prompts.
 - **Local-first:**, No telemetry, or background network request.
 - **Clean:** Beautiful, simple & clutter free UI.
